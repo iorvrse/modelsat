@@ -9,6 +9,8 @@
 #define BMP280_SAMPLE_TIME_MS		100
 #define TELEMETRY_SAMPLE_TIME_MS	200
 
+#define SWITCH 14
+
 typedef enum : uint8_t
 {
     CMD_TEAM_ID = 0,
@@ -17,6 +19,7 @@ typedef enum : uint8_t
     CMD_RELEASE,
     CMD_CAL,
     CMD_FILTER,
+	CMD_MISSION_TIME,
     WIFI_RSSI = 249,
     GCS_LOCATION_DATA,
     PAYLOAD_PING_DATA,
@@ -30,6 +33,9 @@ uint8_t broadcastAddress[] = {0xC8, 0x2E, 0x18, 0x8D, 0x74, 0xB8};
 
 Adafruit_BMP280 bmp;
 uint32_t pressure = 0;
+uint8_t limitSwitch = 0;
+unsigned long switch_time = 0;  
+unsigned long last_switch_time = 0; 
 
 TaskHandle_t bmpTaskHandle;
 TaskHandle_t telemetryTaskHandle;
@@ -45,6 +51,17 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
 		log_n("Failed to send data");
 }
 
+
+void IRAM_ATTR isr()
+{
+    switch_time = millis();
+	if (switch_time - last_switch_time > 500)
+	{
+		limitSwitch = 1;
+		last_switch_time = switch_time;
+	}
+}
+
 void setup()
 {
 	Serial.begin(115200);
@@ -54,6 +71,9 @@ void setup()
 		log_n("BMP280 not found!");
 		return;
 	}
+
+	pinMode(SWITCH, INPUT_PULLUP);
+	attachInterrupt(SWITCH, isr, LOW);
 
 	WiFi.mode(WIFI_STA);
 	WiFi.setTxPower(WIFI_POWER_19_5dBm);
@@ -99,15 +119,16 @@ void telemetryTask(void *pvParameters)
 {
 	while (1)
 	{
-		uint8_t container_buffer[sizeof(message_type_t) + sizeof(uint32_t) + 3];
+		uint8_t container_buffer[sizeof(message_type_t) + sizeof(uint32_t) + 4];
 		container_buffer[0] = 0x7E; // Start byte
 		container_buffer[1] = sizeof(container_buffer); // Length
 		container_buffer[2] = CONTAINER_DATA; // Message type
 		memcpy(&container_buffer[3], &pressure, sizeof(uint32_t));
+		container_buffer[sizeof(container_buffer) - 2] = limitSwitch; // Limit switch status
 		container_buffer[sizeof(container_buffer) - 1] = calcCRC8(container_buffer, sizeof(container_buffer) - 1, 213); // CRC8
 
 		esp_now_send(broadcastAddress, container_buffer, sizeof(container_buffer));
-		log_n("Pressure: %d", pressure);
+		log_n("Pressure: %d, limitSwitch: %d", pressure, limitSwitch);
 		
 		vTaskDelay(TELEMETRY_SAMPLE_TIME_MS / portTICK_PERIOD_MS);
 	}

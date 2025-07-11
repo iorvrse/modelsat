@@ -17,6 +17,7 @@ typedef enum : uint8_t
     CMD_RELEASE,
     CMD_CAL,
     CMD_FILTER,
+	CMD_MISSION_TIME,
     WIFI_RSSI = 249,
     GCS_LOCATION_DATA,
     PAYLOAD_PING_DATA,

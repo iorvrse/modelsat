@@ -8,26 +8,28 @@
 #include <TinyGPS++.h>
 #include <ESP32Servo.h>
 #include <CRC.h>
+#include <time.h>
 #include "FS.h"
 #include "SD.h"
 #include "SPI.h"
 #include "I2Cdev.h"
-#include "MPU6050_6Axis_MotionApps20.h"
+#include "MPU6050_6Axis_MotionApps612.h"
+#include "uRTCLib.h"
 
 #define RXD2 16
 #define TXD2 17
 
+#define MPU_INT	13
+
 #define GPS_BAUD 9600
 
-// typedef struct
-// {
-// 	uint8_t year;
-// 	uint8_t month;
-// 	uint8_t day;
-// 	uint8_t hour;
-// 	uint8_t minute;
-// 	uint8_t second;
-// } mission_time_t;
+#define FILTER_DISK1	32
+#define FILTER_DISK2	26
+
+#define FILTER_RED_ANGLE		45
+#define FILTER_GREEN_ANGLE		90
+#define FILTER_BLUE_ANGLE		135
+#define FILTER_CLEAR_ANGLE		0
 
 typedef struct
 {
@@ -60,6 +62,7 @@ typedef enum : uint8_t
     CMD_RELEASE,
     CMD_CAL,
     CMD_FILTER,
+	CMD_MISSION_TIME,
     WIFI_RSSI = 249,
     GCS_LOCATION_DATA,
     PAYLOAD_PING_DATA,
@@ -71,15 +74,15 @@ typedef enum : uint8_t
 
 typedef enum : uint8_t
 {
-    FILTER_CODE_M = 0,
-    FILTER_CODE_F,
-    FILTER_CODE_N,
-    FILTER_CODE_R,
-    FILTER_CODE_G,
-    FILTER_CODE_B,
-    FILTER_CODE_P,
-    FILTER_CODE_Y,
-    FILTER_CODE_C
+    FILTER_CODE_M = 'M',
+    FILTER_CODE_F = 'F',
+    FILTER_CODE_N = 'N',
+    FILTER_CODE_R = 'R',
+    FILTER_CODE_G = 'G',
+    FILTER_CODE_B = 'B',
+    FILTER_CODE_P = 'P',
+    FILTER_CODE_Y = 'Y',
+    FILTER_CODE_C = 'C'
 } filter_code_t;
 
 typedef enum : uint8_t
@@ -96,16 +99,29 @@ packet_t packet = {
 	.team_id = 632419
 };
 state_t state;
+filter_code_t filter_code;
 TinyGPSPlus gps;
 HardwareSerial gpsSerial(2);
 MPU6050 mpu;
+
 Adafruit_BMP280 bmp;
-Servo releaseServo, filterServo;
+Servo releaseServo, filterServo1, filterServo2;
+uRTCLib rtc(0x68);
 Preferences preferences;
 uint8_t broadcastAddress[] = {0xC0, 0x49, 0xEF, 0xF9, 0x97, 0xCA};
 char filterColorChar[9] = {'M', 'F', 'N', 'R', 'G', 'B', 'P', 'Y', 'C'};
 float altitude_payload, altitude_container, temp_altitude, ref_altitude;
 bool telemetry_on;
+uint8_t limitSwitch;
+
+// MPU control/status vars
+volatile bool mpuInterrupt = false;
+bool dmpReady = false;  // set true if DMP init was successful
+uint8_t mpuIntStatus;   // holds actual interrupt status byte from MPU
+uint8_t devStatus;      // return status after each device operation (0 = success, !0 = error)
+uint16_t packetSize;    // expected DMP packet size (default is 42 bytes)
+uint16_t fifoCount;     // count of all bytes currently in FIFO
+uint8_t fifoBuffer[64]; // FIFO storage buffer
 
 TaskHandle_t bmpTaskHandle;
 TaskHandle_t voltTaskHandle;
@@ -131,6 +147,78 @@ void errorCodeTask(void *pvParameters);
 void missionTimeTask(void *pvParameters);
 void cameraFilterTask(void *pvParameters);
 
+void filter_mechanism()
+{
+	filter_code = (filter_code_t)packet.lnln[0];
+	switch (filter_code)
+	{
+		case FILTER_CODE_M:
+			filterServo1.write(FILTER_RED_ANGLE);
+			filterServo2.write(FILTER_RED_ANGLE);
+			log_n("Filter set to M");
+			break;
+			
+		case FILTER_CODE_F:
+			filterServo1.write(FILTER_GREEN_ANGLE);
+			filterServo2.write(FILTER_GREEN_ANGLE);
+			log_n("Filter set to F");
+			break;
+
+		case FILTER_CODE_N:
+			filterServo1.write(FILTER_BLUE_ANGLE);
+			filterServo2.write(FILTER_BLUE_ANGLE);
+			log_n("Filter set to N");
+			break;
+			
+		case FILTER_CODE_R:
+			filterServo1.write(FILTER_CLEAR_ANGLE);
+			filterServo2.write(FILTER_RED_ANGLE);
+			log_n("Filter set to R");
+			break;
+			
+		case FILTER_CODE_G:
+			filterServo1.write(FILTER_CLEAR_ANGLE);
+			filterServo2.write(FILTER_GREEN_ANGLE);
+			log_n("Filter set to G");
+			break;
+
+		case FILTER_CODE_B:
+			filterServo1.write(FILTER_CLEAR_ANGLE);
+			filterServo2.write(FILTER_BLUE_ANGLE);
+			log_n("Filter set to B");
+			break;
+
+		case FILTER_CODE_P:
+			filterServo1.write(FILTER_RED_ANGLE);
+			filterServo2.write(FILTER_RED_ANGLE);
+			log_n("Filter set to P");
+			break;
+			
+		case FILTER_CODE_Y:
+			filterServo1.write(FILTER_RED_ANGLE);
+			filterServo2.write(FILTER_GREEN_ANGLE);
+			log_n("Filter set to Y");
+			break;
+			
+		case FILTER_CODE_C:
+			filterServo1.write(FILTER_BLUE_ANGLE);
+			filterServo2.write(FILTER_GREEN_ANGLE);
+			log_n("Filter set to C");
+			break;
+			
+		default:
+			filterServo1.write(FILTER_CLEAR_ANGLE);
+			filterServo2.write(FILTER_CLEAR_ANGLE);
+			log_n("Filter set to default (no filter)");
+			break;
+	}
+}
+	
+void dmpDataReady()
+{
+	mpuInterrupt = true;
+}
+	
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
 {
 	if (status == ESP_NOW_SEND_SUCCESS)
@@ -153,7 +241,7 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *payload, int length)
 					log_n("Team ID written: %d", packet.team_id);
 					break;
 					
-					case CMD_TELEM_ON:
+				case CMD_TELEM_ON:
 					if(eTaskGetState(telemetryTaskHandle) != eRunning)
 					{
 						vTaskResume(telemetryTaskHandle);
@@ -187,11 +275,19 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *payload, int length)
 					
 				case CMD_FILTER:
 					memcpy(&packet.lnln, &payload[3], sizeof(packet.lnln));
-					log_n("Filter Command: %c %d %c %d", filterColorChar[payload[1]], payload[2], filterColorChar[payload[3]], payload[4]);
+					log_n("Filter Command: %c %d %c %d", packet.lnln[0], packet.lnln[1], packet.lnln[2], packet.lnln[3]);
+					vTaskResume(cameraFilterTaskHandle);
 					break;
-		
+
+				case CMD_MISSION_TIME:
+					memcpy(&packet.mission_time, &payload[3], sizeof(packet.mission_time));
+					log_n("Mission Time: %d", packet.mission_time);
+					// TODO: Add setting mission time in RTC
+					break;
+					
 				case CONTAINER_DATA:
 					memcpy(&packet.pressure_container, &payload[3], sizeof(packet.pressure_container));
+					limitSwitch = payload[length - 2];
 					log_n("Container Data: Pressure: %d", packet.pressure_container);
 					break;
 					
@@ -222,40 +318,51 @@ void setup()
     packet.team_id = preferences.getUInt("TEAM_ID", 0);
     telemetry_on = preferences.getBool("TELEMETRY_ON", false);
 	state = (state_t)preferences.getUInt("STATE", READY_TO_FLIGHT);
-	packet.mission_time = preferences.getUInt("MISSION_TIME", 0);
 	ref_altitude = preferences.getFloat("REF_ALTITUDE", 0);
 
 	if (!bmp.begin(0x76))
 	{
 		log_n("BMP280 not found!");
-		while (1);
+		// return;
 	}
 	
 	if (!mpu.testConnection())
 	{
 		log_n("MPU6050 not connected!");
-		while (1);
+		// return;
 	}
 	
-	mpu.initialize();
-	mpu.dmpInitialize();
-	mpu.setXAccelOffset(-1343);
-	mpu.setYAccelOffset(-1155);
-	mpu.setZAccelOffset(1033);
-	mpu.setXGyroOffset(19);
-	mpu.setYGyroOffset(-27);
-	mpu.setZGyroOffset(16);
-	mpu.setDMPEnabled(true);
+	// mpu.initialize();
+	// devStatus = mpu.dmpInitialize();
+
+	// mpu.setXGyroOffset(51);
+	// mpu.setYGyroOffset(8);
+	// mpu.setZGyroOffset(21);
+	// mpu.setXAccelOffset(1150);
+	// mpu.setYAccelOffset(-50);
+	// mpu.setZAccelOffset(1060);
+
+	// if (devStatus == 0)
+	// {
+	// 	mpu.CalibrateAccel(6);
+	// 	mpu.CalibrateGyro(6);
+	// 	mpu.PrintActiveOffsets();
+	// 	mpu.setDMPEnabled(true);
+	// 	attachInterrupt(MPU_INT, dmpDataReady, RISING);
+	// 	mpuIntStatus = mpu.getIntStatus();
+	// 	dmpReady = true;
+	// 	packetSize = mpu.dmpGetFIFOPacketSize();
+	// }
 
 	gpsSerial.begin(GPS_BAUD, SERIAL_8N1, RXD2, TXD2);
 
 	if(!SD.begin())
 	{
 		log_n("Card Mount Failed");
-		return;
+		// return;
 	}
 
-	char *path = "./log.txt";
+	const char *path = "/log.txt";
 	File file;
 	if (SD.exists(path))
         file = SD.open(path, FILE_APPEND);
@@ -265,12 +372,15 @@ void setup()
 	if(!file)
 	{
 		log_n("Failed to create/open file");
-		return;
+		// return;
 	}
 	file.close();
 
-	releaseServo.attach(4);
-	filterServo.attach(5);
+	URTCLIB_WIRE.begin();
+
+	// releaseServo.attach(4);
+	filterServo1.attach(FILTER_DISK1);
+	filterServo2.attach(FILTER_DISK2);
 
 	WiFi.mode(WIFI_STA);
 	WiFi.setTxPower(WIFI_POWER_19_5dBm);
@@ -279,7 +389,7 @@ void setup()
 	if(esp_now_init() != ESP_OK)
 	{
         log_n("Error initializing ESP-NOW");
-        return;
+        // return;
     }
 	
 	esp_now_peer_info_t peerInfo = {};
@@ -290,7 +400,7 @@ void setup()
 	if(esp_now_add_peer(&peerInfo) != ESP_OK)
 	{
 		log_n("Failed to add peer");
-        return;
+        // return;
     }
 	
 	esp_now_register_recv_cb(esp_now_recv_cb_t(OnDataRecv));
@@ -301,8 +411,11 @@ void setup()
 	xTaskCreate(telemetryTask, "Telemetry Task", 8192, NULL, 1, &telemetryTaskHandle);
 	xTaskCreate(gpsTask, "GPS Task", 4096, NULL, 1, &gpsTaskHandle);
 	xTaskCreate(memoryTask, "Memory Task", 8192, NULL, 1, &memoryTaskHandle);
-	xTaskCreate(imuTask, "IMU Task", 2048, NULL, 1, &imuTaskHandle);
+	// xTaskCreate(imuTask, "IMU Task", 8192, NULL, 1, &imuTaskHandle);
 	xTaskCreate(stateTask, "State Task", 2048, NULL, 1, &stateTaskHandle);
+	xTaskCreate(errorCodeTask, "Error Code Task", 2048, NULL, 1, &errorCodeTaskHandle);
+	xTaskCreate(missionTimeTask, "Mission Time Task", 2048, NULL, 1, &missionTimeTaskHandle);
+	xTaskCreate(cameraFilterTask, "Camera Filter Task", 2048, NULL, 1, &cameraFilterTaskHandle);
 }
 
 void loop()
@@ -334,12 +447,6 @@ void gpsTask(void *pvParameters)
 				packet.gps_latitude = gps.location.lat();
 				packet.gps_longitude = gps.location.lng();
 				packet.gps_altitude = (int16_t)(gps.altitude.meters() * 10);
-				// packet.mission_time.year = gps.date.year();
-				// packet.mission_time.month = gps.date.month();
-				// packet.mission_time.day = gps.date.day();
-				// packet.mission_time.hour = gps.time.hour();
-				// packet.mission_time.minute = gps.time.minute();
-				// packet.mission_time.second = gps.time.second();
 			}
 		}
 		vTaskDelay(1000 / portTICK_PERIOD_MS);
@@ -405,51 +512,29 @@ void descentRateTask(void *pvParameters)
 
 void imuTask(void *pvParameters)
 {
-	uint16_t packetSize;
-	uint16_t fifoCount;
-	uint8_t fifoBuffer[64];
-	Quaternion q;
-	VectorFloat gravity;
-	float ypr[3];
-
-	packetSize = mpu.dmpGetFIFOPacketSize();
-	fifoCount = mpu.getFIFOCount();
+	// orientation/motion vars
+	Quaternion q;           // [w, x, y, z]         quaternion container
+	VectorInt16 aa;         // [x, y, z]            accel sensor measurements
+	VectorInt16 aaReal;     // [x, y, z]            gravity-free accel sensor measurements
+	VectorInt16 aaWorld;    // [x, y, z]            world-frame accel sensor measurements
+	VectorFloat gravity;    // [x, y, z]            gravity vector
+	float euler[3];         // [psi, theta, phi]    Euler angle container
+	float ypr[3];           // [yaw, pitch, roll]   yaw/pitch/roll container and gravity vector
 
 	while (1)
 	{
-		while (fifoCount < packetSize)
-		{
-			fifoCount = mpu.getFIFOCount();
+		if (!dmpReady) return;
+
+  		if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) { // Get the Latest packet 
+			mpu.dmpGetQuaternion(&q, fifoBuffer);
+			mpu.dmpGetGravity(&gravity, &q);
+			mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+			packet.yaw = (int16_t)(ypr[0] * 180 / M_PI * 100);
+			packet.pitch = (int16_t)(ypr[1] * 180 / M_PI * 100);
+			packet.roll = (int16_t)(ypr[2] * 180 / M_PI * 100);
 		}
 
-		if (fifoCount >= 1024)
-		{
-			mpu.resetFIFO();
-			log_n("FIFO overflow!");	
-		}
-		else
-		{
-			if (fifoCount % packetSize != 0)
-			{
-				mpu.resetFIFO();
-			}
-			else
-			{
-				while (fifoCount >= packetSize)
-				{
-					mpu.getFIFOBytes(fifoBuffer,packetSize);
-					fifoCount -= packetSize;				
-				}    
-				
-				mpu.dmpGetQuaternion(&q,fifoBuffer);
-				mpu.dmpGetGravity(&gravity,&q);
-				mpu.dmpGetYawPitchRoll(ypr,&q,&gravity);          
-				packet.pitch = (int16_t)(ypr[1] * 180 / M_PI * 100);
-				packet.roll = (int16_t)(ypr[2] * 180 / M_PI * 100);
-				packet.yaw = (int16_t)(ypr[0] * 180 / M_PI * 100);
-			}
-		}
-		vTaskDelay(100 / portTICK_PERIOD_MS);
+		vTaskDelay(200 / portTICK_PERIOD_MS);
 	}
 }
 
@@ -481,8 +566,9 @@ void telemetryTask(void *pvParameters)
 void memoryTask(void *pvParameters)
 {
 	File file;
-	char *path = "./log.txt";
+	const char *path = "/log.txt";
 	char packet_str[256];
+	
 	while (1)
 	{
 		sprintf(packet_str, "PN:%d,S:%d,E:%d,MT:%d,P1:%.2f,P2:%.2f,A1:%.2f,A2:%.2f,AD:%.2f,DR:%.2f,T:%.2f,V:%.1f,LAT:%.4f,LON:%.4f,GA:%.4f,P:%.2f,R:%.2f,Y:%.2f,IOT1:%.2f,IOT2:%.2f,ID:%d\r\n",
@@ -508,6 +594,8 @@ void memoryTask(void *pvParameters)
             (float)packet.iot2 / 100.0,
             packet.team_id
 		);
+
+		log_n("Logging data: %s", packet_str);
 
 		file = SD.open(path, FILE_APPEND);
 		if(!file.print(packet_str))
@@ -560,7 +648,7 @@ void stateTask(void *pvParameters)
 				break;
 
 			case SATELLITE_DESCENT:
-				if (altitude_payload <= 450 && !invalid_descent)
+				if (altitude_payload <= 450 && limitSwitch && !invalid_descent)
 				{
 					// TODO: Add servo mechanism to release payload
 					// releaseServo.write(90);
@@ -613,9 +701,24 @@ void errorCodeTask(void *pvParameters)
 
 void missionTimeTask(void *pvParameters)
 {
+	struct tm t;
+	
 	while (1)
 	{
-		vTaskDelay(1000 / portTICK_PERIOD_MS);
+		rtc.refresh();
+
+        t.tm_year = rtc.year() + 2000 - 1900; // rtc.year() returns e.g. 24 for 2024
+        t.tm_mon  = rtc.month(); - 1;          // tm_mon is 0-11
+        t.tm_mday = rtc.day();
+        t.tm_hour = rtc.hour();
+        t.tm_min  = rtc.minute();
+        t.tm_sec  = rtc.second();
+        t.tm_isdst = 0;
+
+		time_t epoch = mktime(&t);
+		packet.mission_time = (uint32_t)epoch;
+
+		vTaskDelay(500 / portTICK_PERIOD_MS);
 	}
 }
 
@@ -623,6 +726,14 @@ void cameraFilterTask(void *pvParameters)
 {
 	while (1)
 	{
-		vTaskDelay(1000 / portTICK_PERIOD_MS);
+		filter_mechanism();
+		vTaskDelay(packet.lnln[1]  / portTICK_PERIOD_MS);
+		filter_mechanism();
+		vTaskDelay(packet.lnln[3]  / portTICK_PERIOD_MS);
+
+		filterServo1.write(FILTER_CLEAR_ANGLE);
+		filterServo2.write(FILTER_CLEAR_ANGLE);
+
+		vTaskSuspend(NULL);
 	}
 }
